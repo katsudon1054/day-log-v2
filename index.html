@@ -1,0 +1,1467 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Work Log</title>
+<style>
+  html, body { margin: 0; padding: 0; }
+  * { box-sizing: border-box; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/plain" id="app-source">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ---------- design tokens ----------
+const C = {
+  paper: "#FAFAF7",
+  card: "#F2EFE6",
+  ink: "#1C1F26",
+  inkSoft: "#6B7178",
+  line: "#DCD9CE",
+  accent: "#3B6E63",
+  accentSoft: "#E4ECE9",
+  amber: "#C97B3D",
+  amberSoft: "#F5E8DB",
+  danger: "#A3402E",
+};
+
+const FONTS = `
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
+`;
+
+function pad(n) { return n.toString().padStart(2, "0"); }
+
+function todayKey(offsetDays = 0) {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function displayDate(key) {
+  const [y, m, d] = key.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  const wd = ["日", "月", "火", "水", "木", "金", "土"][dt.getDay()];
+  return `${m}月${d}日（${wd}）`;
+}
+
+function dateOnly(key) {
+  const [, m, d] = key.split("-").map(Number);
+  return `${m}月${d}日`;
+}
+
+function weekdayOnly(key) {
+  const [y, m, d] = key.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  return ["日", "月", "火", "水", "木", "金", "土"][dt.getDay()];
+}
+
+function nowTime() {
+  const d = new Date();
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function minutesToLabel(min) {
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  if (h === 0) return `${m}分`;
+  if (m === 0) return `${h}時間`;
+  return `${h}時間${m}分`;
+}
+
+// ---------- Anthropic API (ユーザー自身のAPIキーを使用) ----------
+const API_KEY_STORAGE = "daylog_anthropic_api_key";
+
+function getApiKey() {
+  return localStorage.getItem(API_KEY_STORAGE) || "";
+}
+
+function promptForApiKey() {
+  const key = window.prompt(
+    "Anthropic APIキーを入力してください。\nこのPCのブラウザ内（localStorage）にのみ保存され、外部には送信されません。"
+  );
+  if (key && key.trim()) {
+    localStorage.setItem(API_KEY_STORAGE, key.trim());
+    return key.trim();
+  }
+  return "";
+}
+
+function clearApiKey() {
+  localStorage.removeItem(API_KEY_STORAGE);
+}
+
+async function callClaude(prompt) {
+  let apiKey = getApiKey();
+  if (!apiKey) {
+    apiKey = promptForApiKey();
+    if (!apiKey) throw new Error("APIキーが未設定です");
+  }
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-5",
+      max_tokens: 1000,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+
+  if (response.status === 401) {
+    clearApiKey();
+    throw new Error("APIキーが無効です。もう一度お試しください（次回入力し直せます）");
+  }
+  if (!response.ok) throw new Error("API request failed");
+  const data = await response.json();
+  return data.content.map((b) => (b.type === "text" ? b.text : "")).join("\n");
+}
+
+function stripFence(text) {
+  return text.replace(/```json/g, "").replace(/```/g, "").trim();
+}
+
+// ---------- 記録項目の固定リスト ----------
+// 「タスク管理ツール プルダウン項目 要件定義書」（20260806）に準拠
+const SHUBETSU_OPTIONS = ["タスク", "MTG", "計画・企画", "その他"];
+
+// 種別ごとの必須・任意ルール。true=必須
+const REQUIRE_RULES = {
+  "タスク": { taisho: true, genre: true, koumoku: true },
+};
+function requireRule(shubetsu) {
+  return REQUIRE_RULES[shubetsu] || { taisho: true, genre: false, koumoku: false };
+}
+
+const TAISHO_GROUPS = [
+  {
+    label: "外部クライアント",
+    options: ["Kimini英会話", "創造学園", "CAIスクール", "クランテテ", "クロッカ", "みらいゲート"],
+  },
+  {
+    label: "インハウス",
+    options: [
+      "学研WILL学園", "えるフル", "学研の家庭教師（訪問支援）", "G-Pathエージェント",
+      "G-Pathバイト", "G-Path派遣", "自治体支援", "福祉プロジェクト（福祉P）", "出発式（社内単発企画）",
+    ],
+  },
+  {
+    label: "予備枠",
+    options: ["自分（事務用）", "未定", "その他"],
+  },
+];
+const INHOUSE_TAISHO = new Set(TAISHO_GROUPS[1].options);
+const EXTERNAL_TAISHO = new Set(TAISHO_GROUPS[0].options);
+function taishoBadge(taisho) {
+  if (INHOUSE_TAISHO.has(taisho)) return "インハウス";
+  if (EXTERNAL_TAISHO.has(taisho)) return "外部クライアント";
+  return null; // 予備枠（自分・未定・その他）はバッジなし
+}
+
+const GENRE_OPTIONS = [
+  "広告動画", "広告静止画", "動画", "静止画", "LP制作", "サイト改修", "LINE・Lステップ構築",
+  "SNS投稿", "記事・コラム", "ロゴ", "資料", "レポート・分析", "戦略設計",
+];
+const GENRE_LABELS = {
+  "LP制作": "LP制作（ランディングページ制作）",
+};
+
+const KOUMOKU_OPTIONS = [
+  "構成", "ワイヤーフレーム", "制作", "確認", "FB対応", "納品・共有", "調査・分析",
+  "動画編集", "素材準備", "スケジュール設計", "ヒアリング", "計測設定", "その他",
+];
+const KOUMOKU_LABELS = {
+  "FB対応": "FB対応（フィードバック対応）",
+};
+
+// 新形式（種別/対象/成果物/工程/修正フラグ）と旧形式 entry.task（自由記述の文字列。
+// 過去バージョンの保存データ用）の両方に対応する
+function entryDisplayText(entry) {
+  if (entry.task) return entry.task;
+  let label = [entry.shubetsu, entry.taisho, entry.genre, entry.koumoku].filter(Boolean).join("-");
+  if (entry.isFix) label += " [修正]";
+  return entry.memo ? `${label}　${entry.memo}` : label;
+}
+
+// ---------- speech-to-text hook ----------
+function useSpeechInput(onResult) {
+  const [listening, setListening] = useState(false);
+  const [supported] = useState(
+    () => typeof window !== "undefined" && (window.SpeechRecognition || window.webkitSpeechRecognition)
+  );
+  const [lastError, setLastError] = useState(null);
+  const recRef = useRef(null);
+
+  const start = useCallback(() => {
+    if (!supported) return;
+    setLastError(null);
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const rec = new SR();
+    rec.lang = "ja-JP";
+    rec.interimResults = false;
+    rec.maxAlternatives = 1;
+    rec.onresult = (e) => {
+      const text = e.results[0][0].transcript;
+      onResult(text);
+    };
+    rec.onend = () => setListening(false);
+    rec.onerror = (e) => {
+      setListening(false);
+      setLastError(e.error || "unknown");
+    };
+    recRef.current = rec;
+    try {
+      setListening(true);
+      rec.start();
+    } catch (err) {
+      setListening(false);
+      setLastError("start-exception: " + (err && err.message ? err.message : String(err)));
+    }
+  }, [supported, onResult]);
+
+  const stop = useCallback(() => {
+    recRef.current?.stop();
+    setListening(false);
+  }, []);
+
+  return { supported, listening, start, stop, lastError };
+}
+
+function MicButton({ onResult, size = 40 }) {
+  const { supported, listening, start, stop, lastError } = useSpeechInput(onResult);
+  if (!supported) return null;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3 }}>
+      <button
+        type="button"
+        onClick={listening ? stop : start}
+        title={listening ? "録音を止める" : "音声で入力（毎回タップで再試行します）"}
+        style={{
+          width: size,
+          height: size,
+          minWidth: size,
+          borderRadius: "50%",
+          border: "none",
+          background: lastError ? C.danger : (listening ? "#A3402E" : "#3B6E63"),
+          color: "#fff",
+          fontSize: size * 0.45,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          cursor: "pointer",
+          flexShrink: 0,
+          animation: listening ? "pulse 1.2s infinite" : "none",
+        }}
+      >
+        {listening ? "●" : "🎤"}
+      </button>
+      {lastError && (
+        <div
+          style={{
+            fontFamily: "JetBrains Mono, monospace",
+            fontSize: 9,
+            color: C.danger,
+            maxWidth: size * 3,
+            textAlign: "center",
+            lineHeight: 1.3,
+          }}
+        >
+          エラー: {lastError}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- storage helpers (localStorage) ----------
+async function getJSON(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+async function setJSON(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch {
+    return false;
+  }
+}
+function listKeysWithPrefix(prefix) {
+  const keys = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && k.startsWith(prefix)) keys.push(k);
+  }
+  return keys;
+}
+
+// ---------- tab bar ----------
+function TabBar({ active, onChange }) {
+  const tabs = [
+    { id: "log", label: "記録" },
+    { id: "summary", label: "まとめ" },
+    { id: "weekly", label: "振り返り" },
+    { id: "export", label: "書き出し" },
+  ];
+  return (
+    <div
+      style={{
+        display: "flex",
+        borderTop: `1px solid ${C.line}`,
+        background: C.paper,
+        position: "sticky",
+        bottom: 0,
+      }}
+    >
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          onClick={() => onChange(t.id)}
+          style={{
+            flex: 1,
+            padding: "14px 0",
+            background: "none",
+            border: "none",
+            fontFamily: "Inter, sans-serif",
+            fontSize: 13,
+            fontWeight: 600,
+            color: active === t.id ? C.accent : C.inkSoft,
+            borderTop: active === t.id ? `2px solid ${C.accent}` : "2px solid transparent",
+            marginTop: -1,
+            cursor: "pointer",
+          }}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ---------- LOG TAB ----------
+function emptyRow() {
+  return {
+    rowId: Date.now() + Math.random(),
+    shubetsu: "タスク",
+    taisho: "",
+    genre: "",
+    koumoku: "",
+    isFix: false,
+    memo: "",
+    hours: 0,
+    mins: 0,
+  };
+}
+
+function isRowValid(r) {
+  const rule = requireRule(r.shubetsu);
+  if (!r.shubetsu || !r.taisho) return false;
+  if (rule.genre && !r.genre) return false;
+  if (rule.koumoku && !r.koumoku) return false;
+  return r.hours * 60 + r.mins > 0;
+}
+
+function LogTab({ entries, onAdd, onDelete, adding, dateKey, isToday }) {
+  const [rows, setRows] = useState([emptyRow()]);
+
+  const total = entries.reduce((s, e) => s + e.minutes, 0);
+
+  const updateRow = (rowId, patch) => {
+    setRows((prev) => prev.map((r) => (r.rowId === rowId ? { ...r, ...patch } : r)));
+  };
+  const addRow = () => setRows((prev) => [...prev, emptyRow()]);
+  const removeRow = (rowId) => setRows((prev) => (prev.length > 1 ? prev.filter((r) => r.rowId !== rowId) : prev));
+
+  const validRows = rows.filter(isRowValid);
+
+  const submit = () => {
+    if (validRows.length === 0) return;
+    const now = nowTime();
+    const newEntries = validRows.map((r) => ({
+      id: Date.now() + Math.random(),
+      time: now,
+      shubetsu: r.shubetsu,
+      taisho: r.taisho,
+      genre: r.genre,
+      koumoku: r.koumoku,
+      isFix: r.isFix,
+      memo: r.memo.trim(),
+      minutes: r.hours * 60 + r.mins,
+    }));
+    onAdd(newEntries);
+    setRows([emptyRow()]);
+  };
+
+  const fieldSelectStyle = {
+    width: "100%",
+    padding: "8px 6px",
+    borderRadius: 10,
+    border: `1px solid ${C.line}`,
+    background: "#fff",
+    color: C.ink,
+    fontFamily: "Inter, sans-serif",
+    fontSize: 13.5,
+    outline: "none",
+  };
+
+  const timeSelectStyle = {
+    flex: 1,
+    padding: "8px 6px",
+    borderRadius: 10,
+    border: `1px solid ${C.line}`,
+    background: "#fff",
+    color: C.ink,
+    fontFamily: "JetBrains Mono, monospace",
+    fontSize: 14,
+    outline: "none",
+  };
+
+  return (
+    <div style={{ padding: "16px 16px 24px" }}>
+      <div
+        style={{
+          background: C.card,
+          borderRadius: 20,
+          padding: "18px 20px",
+          marginBottom: 18,
+        }}
+      >
+        <div style={{ fontFamily: "Inter, sans-serif", fontSize: 12, color: C.inkSoft, fontWeight: 600 }}>
+          {displayDate(dateKey)}の稼働{!isToday && "（編集中）"}
+        </div>
+        <div
+          style={{
+            fontFamily: "'Fraunces', serif",
+            fontSize: 34,
+            fontWeight: 600,
+            color: C.ink,
+            marginTop: 2,
+          }}
+        >
+          {minutesToLabel(total)}
+        </div>
+        <div style={{ fontFamily: "Inter, sans-serif", fontSize: 12, color: C.inkSoft, marginTop: 2 }}>
+          {entries.length}件の記録
+        </div>
+      </div>
+
+      <div
+        style={{
+          background: "#fff",
+          border: `1px solid ${C.line}`,
+          borderRadius: 18,
+          padding: 16,
+          marginBottom: 22,
+        }}
+      >
+        {rows.map((row, i) => {
+          const badge = taishoBadge(row.taisho);
+          const rule = requireRule(row.shubetsu);
+          const fixButtonStyle = {
+            border: `1px solid ${row.isFix ? C.amber : C.line}`,
+            background: row.isFix ? C.amber : "#fff",
+            color: row.isFix ? "#fff" : C.inkSoft,
+            borderRadius: 10,
+            padding: "8px 6px",
+            fontFamily: "Inter, sans-serif",
+            fontSize: 13.5,
+            fontWeight: 600,
+            cursor: "pointer",
+            width: "100%",
+          };
+          return (
+            <div
+              key={row.rowId}
+              style={{
+                marginBottom: 14,
+                paddingBottom: i < rows.length - 1 ? 14 : 0,
+                borderBottom: i < rows.length - 1 ? `1px dashed ${C.line}` : "none",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                {rows.length > 1 && (
+                  <button
+                    onClick={() => removeRow(row.rowId)}
+                    style={{
+                      border: "none",
+                      background: "none",
+                      color: C.inkSoft,
+                      fontSize: 16,
+                      cursor: "pointer",
+                      lineHeight: 1,
+                      padding: 2,
+                    }}
+                    aria-label="この項目を削除"
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 4 }}>
+                <select
+                  value={row.shubetsu}
+                  onChange={(e) => updateRow(row.rowId, { shubetsu: e.target.value })}
+                  style={fieldSelectStyle}
+                >
+                  {SHUBETSU_OPTIONS.map((v) => (
+                    <option key={v} value={v}>
+                      {v}
+                    </option>
+                  ))}
+                </select>
+                <div>
+                  <select
+                    value={row.taisho}
+                    onChange={(e) => updateRow(row.rowId, { taisho: e.target.value })}
+                    style={fieldSelectStyle}
+                  >
+                    <option value="">対象　※必須</option>
+                    {TAISHO_GROUPS.map((g) => (
+                      <optgroup key={g.label} label={g.label}>
+                        {g.options.map((v) => (
+                          <option key={v} value={v}>
+                            {v}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                  {badge && (
+                    <div style={{ fontFamily: "Inter, sans-serif", fontSize: 10.5, color: C.inkSoft, marginTop: 3 }}>
+                      {badge}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
+                <select
+                  value={row.genre}
+                  onChange={(e) => updateRow(row.rowId, { genre: e.target.value })}
+                  style={fieldSelectStyle}
+                >
+                  <option value="">成果物ジャンル{rule.genre ? "　※必須" : "（任意）"}</option>
+                  {GENRE_OPTIONS.map((v) => (
+                    <option key={v} value={v}>
+                      {GENRE_LABELS[v] || v}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={row.koumoku}
+                  onChange={(e) => updateRow(row.rowId, { koumoku: e.target.value })}
+                  style={fieldSelectStyle}
+                >
+                  <option value="">工程{rule.koumoku ? "　※必須" : "（任意）"}</option>
+                  {KOUMOKU_OPTIONS.map((v) => (
+                    <option key={v} value={v}>
+                      {KOUMOKU_LABELS[v] || v}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div style={{ marginBottom: 8 }}>
+                <button
+                  type="button"
+                  onClick={() => updateRow(row.rowId, { isFix: !row.isFix })}
+                  style={fixButtonStyle}
+                >
+                  {row.isFix ? "✓ 修正" : "修正"}
+                </button>
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                <input
+                  value={row.memo}
+                  onChange={(e) => updateRow(row.rowId, { memo: e.target.value })}
+                  placeholder="メモ（任意・例：LPのFV差し替え）"
+                  style={{
+                    flex: 1,
+                    border: "none",
+                    outline: "none",
+                    fontFamily: "Inter, sans-serif",
+                    fontSize: 15,
+                    color: C.ink,
+                    padding: "8px 4px",
+                    borderBottom: `1px solid ${C.line}`,
+                    background: "transparent",
+                  }}
+                />
+                <MicButton
+                  size={36}
+                  onResult={(text) => updateRow(row.rowId, { memo: row.memo ? row.memo + " " + text : text })}
+                />
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <select
+                  value={row.hours}
+                  onChange={(e) => updateRow(row.rowId, { hours: Number(e.target.value) })}
+                  style={timeSelectStyle}
+                >
+                  {Array.from({ length: 9 }, (_, h) => h).map((h) => (
+                    <option key={h} value={h}>
+                      {h}時間
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={row.mins}
+                  onChange={(e) => updateRow(row.rowId, { mins: Number(e.target.value) })}
+                  style={timeSelectStyle}
+                >
+                  {[0, 10, 20, 30, 40, 50].map((m) => (
+                    <option key={m} value={m}>
+                      {m}分
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          );
+        })}
+
+        <button
+          onClick={addRow}
+          style={{
+            border: `1px dashed ${C.line}`,
+            background: "none",
+            color: C.accent,
+            borderRadius: 10,
+            padding: "6px 12px",
+            fontFamily: "Inter, sans-serif",
+            fontSize: 12.5,
+            fontWeight: 600,
+            cursor: "pointer",
+            marginBottom: 14,
+          }}
+        >
+          ＋ 項目を追加
+        </button>
+
+        <button
+          onClick={submit}
+          disabled={adding || validRows.length === 0}
+          style={{
+            width: "100%",
+            padding: "13px 0",
+            borderRadius: 14,
+            border: "none",
+            background: validRows.length === 0 ? C.line : C.accent,
+            color: "#fff",
+            fontFamily: "Inter, sans-serif",
+            fontWeight: 600,
+            fontSize: 15,
+            cursor: validRows.length === 0 ? "default" : "pointer",
+          }}
+        >
+          {adding ? "記録中…" : `記録する${validRows.length > 1 ? `（${validRows.length}件）` : ""}`}
+        </button>
+      </div>
+
+      <div style={{ position: "relative", paddingLeft: 18 }}>
+        {entries.length > 0 && (
+          <div
+            style={{
+              position: "absolute",
+              left: 4,
+              top: 6,
+              bottom: 6,
+              width: 1,
+              background: C.line,
+            }}
+          />
+        )}
+        {entries.length === 0 && (
+          <div style={{ fontFamily: "Inter, sans-serif", fontSize: 13, color: C.inkSoft, paddingLeft: 4 }}>
+            まだ今日の記録はありません。休憩のたびに一言残しましょう。
+          </div>
+        )}
+        {[...entries].reverse().map((e) => (
+          <div key={e.id} style={{ position: "relative", marginBottom: 16 }}>
+            <div
+              style={{
+                position: "absolute",
+                left: -18,
+                top: 4,
+                width: 9,
+                height: 9,
+                borderRadius: "50%",
+                background: C.accent,
+              }}
+            />
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+              <div>
+                <div
+                  style={{
+                    fontFamily: "JetBrains Mono, monospace",
+                    fontSize: 12,
+                    color: C.inkSoft,
+                  }}
+                >
+                  {e.time}
+                </div>
+                <div style={{ fontFamily: "Inter, sans-serif", fontSize: 14.5, color: C.ink, marginTop: 1 }}>
+                  {entryDisplayText(e)}
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span
+                  style={{
+                    fontFamily: "JetBrains Mono, monospace",
+                    fontSize: 12,
+                    color: C.amber,
+                    background: C.amberSoft,
+                    borderRadius: 999,
+                    padding: "3px 9px",
+                  }}
+                >
+                  {minutesToLabel(e.minutes)}
+                </span>
+                <button
+                  onClick={() => onDelete(e.id)}
+                  style={{
+                    border: "none",
+                    background: "none",
+                    color: C.inkSoft,
+                    fontSize: 16,
+                    cursor: "pointer",
+                    lineHeight: 1,
+                    padding: 2,
+                  }}
+                  aria-label="削除"
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------- SUMMARY TAB ----------
+function SummaryTab({ entries, saved, onSave, saving, generating, onGenerate, aiResult, setAiResult, dateKey }) {
+  const [kizuki, setKizuki] = useState(saved?.kizuki ?? "");
+  const [kadai, setKadai] = useState(saved?.kadai ?? "");
+  const [shippai, setShippai] = useState(saved?.shippai ?? "");
+
+  useEffect(() => {
+    setKizuki(saved?.kizuki ?? "");
+    setKadai(saved?.kadai ?? "");
+    setShippai(saved?.shippai ?? "");
+  }, [saved]);
+
+  const total = entries.reduce((s, e) => s + e.minutes, 0);
+
+  const fieldStyle = {
+    width: "100%",
+    minHeight: 60,
+    border: `1px solid ${C.line}`,
+    borderRadius: 12,
+    padding: 10,
+    fontFamily: "Inter, sans-serif",
+    fontSize: 14,
+    color: C.ink,
+    outline: "none",
+    resize: "vertical",
+    background: "#fff",
+  };
+
+  const labelStyle = {
+    fontFamily: "Inter, sans-serif",
+    fontSize: 12,
+    fontWeight: 600,
+    color: C.inkSoft,
+    marginBottom: 6,
+    marginTop: 16,
+  };
+
+  return (
+    <div style={{ padding: "16px 16px 24px" }}>
+      <div style={{ fontFamily: "'Fraunces', serif", fontSize: 20, fontWeight: 600, color: C.ink, marginBottom: 4 }}>
+        {dateKey === todayKey() ? "今日のまとめ" : "この日のまとめ"}
+      </div>
+      <div style={{ fontFamily: "Inter, sans-serif", fontSize: 12, color: C.inkSoft, marginBottom: 14 }}>
+        {displayDate(dateKey)}・合計 {minutesToLabel(total)}
+      </div>
+
+      <div style={{ background: C.card, borderRadius: 16, padding: 14 }}>
+        <div style={{ fontFamily: "Inter, sans-serif", fontSize: 12, fontWeight: 600, color: C.inkSoft, marginBottom: 8 }}>
+          今日やった作業（休憩ログより）
+        </div>
+        {entries.length === 0 ? (
+          <div style={{ fontFamily: "Inter, sans-serif", fontSize: 13, color: C.inkSoft }}>
+            まだ記録がありません。「記録」タブから追加してください。
+          </div>
+        ) : (
+          entries.map((e) => (
+            <div
+              key={e.id}
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                fontFamily: "Inter, sans-serif",
+                fontSize: 13.5,
+                color: C.ink,
+                padding: "4px 0",
+              }}
+            >
+              <span>{entryDisplayText(e)}</span>
+              <span style={{ fontFamily: "JetBrains Mono, monospace", color: C.inkSoft }}>
+                {minutesToLabel(e.minutes)}
+              </span>
+            </div>
+          ))
+        )}
+      </div>
+
+      <div style={labelStyle}>気づき</div>
+      <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+        <textarea style={fieldStyle} value={kizuki} onChange={(e) => setKizuki(e.target.value)} placeholder="作業していて感じたこと" />
+        <MicButton size={36} onResult={(text) => setKizuki((prev) => (prev ? prev + " " + text : text))} />
+      </div>
+
+      <div style={labelStyle}>課題</div>
+      <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+        <textarea style={fieldStyle} value={kadai} onChange={(e) => setKadai(e.target.value)} placeholder="うまくいかなかった点、詰まった点" />
+        <MicButton size={36} onResult={(text) => setKadai((prev) => (prev ? prev + " " + text : text))} />
+      </div>
+
+      <div style={labelStyle}>失敗したこと</div>
+      <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+        <textarea style={fieldStyle} value={shippai} onChange={(e) => setShippai(e.target.value)} placeholder="あれば。なければ空欄でOK" />
+        <MicButton size={36} onResult={(text) => setShippai((prev) => (prev ? prev + " " + text : text))} />
+      </div>
+
+      <button
+        onClick={() => onGenerate({ kizuki, kadai, shippai })}
+        disabled={generating || entries.length === 0}
+        style={{
+          width: "100%",
+          marginTop: 20,
+          padding: "13px 0",
+          borderRadius: 14,
+          border: "none",
+          background: entries.length === 0 ? C.line : C.amber,
+          color: "#fff",
+          fontFamily: "Inter, sans-serif",
+          fontWeight: 600,
+          fontSize: 15,
+          cursor: entries.length === 0 ? "default" : "pointer",
+        }}
+      >
+        {generating ? "AIがまとめています…" : "AIにまとめてもらう"}
+      </button>
+
+      {aiResult && (
+        <div
+          style={{
+            marginTop: 18,
+            background: C.amberSoft,
+            borderRadius: 16,
+            padding: 16,
+          }}
+        >
+          <div style={{ fontFamily: "Inter, sans-serif", fontSize: 12, fontWeight: 600, color: C.amber, marginBottom: 8 }}>
+            AIからのフィードバック
+          </div>
+          <div style={{ fontFamily: "Inter, sans-serif", fontSize: 14, color: C.ink, whiteSpace: "pre-line", lineHeight: 1.6 }}>
+            {aiResult.feedback}
+          </div>
+        </div>
+      )}
+
+      <button
+        onClick={() => onSave({ kizuki, kadai, shippai })}
+        disabled={saving || entries.length === 0}
+        style={{
+          width: "100%",
+          marginTop: 12,
+          padding: "13px 0",
+          borderRadius: 14,
+          border: `1px solid ${C.accent}`,
+          background: "#fff",
+          color: C.accent,
+          fontFamily: "Inter, sans-serif",
+          fontWeight: 600,
+          fontSize: 15,
+          cursor: "pointer",
+        }}
+      >
+        {saving ? "保存中…" : saved ? "この記録を更新する" : "この記録を保存する"}
+      </button>
+    </div>
+  );
+}
+
+// ---------- WEEKLY TAB ----------
+function WeeklyTab({ records, loading, onGenerate, generating, result }) {
+  return (
+    <div style={{ padding: "16px 16px 24px" }}>
+      <div style={{ fontFamily: "'Fraunces', serif", fontSize: 20, fontWeight: 600, color: C.ink, marginBottom: 4 }}>
+        週次振り返り
+      </div>
+      <div style={{ fontFamily: "Inter, sans-serif", fontSize: 12, color: C.inkSoft, marginBottom: 14 }}>
+        直近7日間の記録
+      </div>
+
+      {loading ? (
+        <div style={{ fontFamily: "Inter, sans-serif", fontSize: 13, color: C.inkSoft }}>読み込み中…</div>
+      ) : records.length === 0 ? (
+        <div
+          style={{
+            background: C.card,
+            borderRadius: 16,
+            padding: 16,
+            fontFamily: "Inter, sans-serif",
+            fontSize: 13.5,
+            color: C.inkSoft,
+          }}
+        >
+          まだ記録がありません。まずは日々の記録をつけてみましょう。
+        </div>
+      ) : (
+        <>
+          {records.map((r) => (
+            <div
+              key={r.date}
+              style={{
+                borderBottom: `1px solid ${C.line}`,
+                padding: "12px 2px",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ fontFamily: "Inter, sans-serif", fontSize: 13.5, fontWeight: 600, color: C.ink }}>
+                  {displayDate(r.date)}
+                </span>
+                <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 12.5, color: C.accent }}>
+                  {minutesToLabel(r.totalMinutes)}
+                </span>
+              </div>
+              {r.kadai && (
+                <div style={{ fontFamily: "Inter, sans-serif", fontSize: 12.5, color: C.inkSoft, marginTop: 4 }}>
+                  課題：{r.kadai}
+                </div>
+              )}
+            </div>
+          ))}
+
+          <button
+            onClick={onGenerate}
+            disabled={generating}
+            style={{
+              width: "100%",
+              marginTop: 18,
+              padding: "13px 0",
+              borderRadius: 14,
+              border: "none",
+              background: C.accent,
+              color: "#fff",
+              fontFamily: "Inter, sans-serif",
+              fontWeight: 600,
+              fontSize: 15,
+              cursor: "pointer",
+            }}
+          >
+            {generating ? "作成中…" : "今週のまとめを作る"}
+          </button>
+        </>
+      )}
+
+      {result && (
+        <div
+          style={{
+            marginTop: 18,
+            background: C.accentSoft,
+            borderRadius: 16,
+            padding: 16,
+            fontFamily: "Inter, sans-serif",
+            fontSize: 14,
+            color: C.ink,
+            whiteSpace: "pre-line",
+            lineHeight: 1.7,
+          }}
+        >
+          {result}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- EXPORT TAB ----------
+function buildTaskRows(dayEntries) {
+  const rows = [["日付", "曜日", "時刻", "種別", "対象", "成果物", "工程", "修正", "メモ", "時間"]];
+  dayEntries.forEach(({ date, entries }) => {
+    entries.forEach((e) => {
+      if (e.task) {
+        rows.push([dateOnly(date), weekdayOnly(date), e.time || "", "", "", "", "", "", e.task, minutesToLabel(e.minutes)]);
+      } else {
+        rows.push([
+          dateOnly(date), weekdayOnly(date), e.time || "",
+          e.shubetsu || "", e.taisho || "", e.genre || "", e.koumoku || "", e.isFix ? "修正" : "", e.memo || "",
+          minutesToLabel(e.minutes),
+        ]);
+      }
+    });
+  });
+  return rows;
+}
+
+function rowsToTSV(rows) {
+  return rows.map((r) => r.join("\t")).join("\n");
+}
+
+function ExportTab() {
+  const [loading, setLoading] = useState(false);
+  const [text, setText] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [range, setRange] = useState(30);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setCopied(false);
+    try {
+      const keys = listKeysWithPrefix("breaklog:").sort().reverse().slice(0, range);
+      const dayEntries = [];
+      for (const k of keys) {
+        const date = k.replace("breaklog:", "");
+        const entries = await getJSON(k, []);
+        if (entries.length) dayEntries.push({ date, entries });
+      }
+      dayEntries.sort((a, b) => (a.date < b.date ? -1 : 1));
+      if (dayEntries.length === 0) {
+        setText("まだ記録がありません。「記録」タブから追加すると、ここに表示されます。");
+      } else {
+        setText(rowsToTSV(buildTaskRows(dayEntries)));
+      }
+    } catch (e) {
+      setText("読み込みに失敗しました。もう一度お試しください。");
+    } finally {
+      setLoading(false);
+    }
+  }, [range]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (e) {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <div style={{ padding: "16px 16px 24px" }}>
+      <div style={{ fontFamily: "'Fraunces', serif", fontSize: 20, fontWeight: 600, color: C.ink, marginBottom: 4 }}>
+        データ書き出し
+      </div>
+      <div style={{ fontFamily: "Inter, sans-serif", fontSize: 12, color: C.inkSoft, marginBottom: 14 }}>
+        日付・時刻・種別・対象・成果物・工程・修正・メモ・時間を1行1作業の表にします。コピーしてスプレッドシートに貼り付けられます（タブ区切り）。
+      </div>
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+        {[7, 30, 90].map((d) => (
+          <button
+            key={d}
+            onClick={() => setRange(d)}
+            style={{
+              padding: "6px 14px",
+              borderRadius: 999,
+              border: `1px solid ${range === d ? C.accent : C.line}`,
+              background: range === d ? C.accentSoft : "transparent",
+              color: range === d ? C.accent : C.inkSoft,
+              fontFamily: "Inter, sans-serif",
+              fontSize: 13,
+              cursor: "pointer",
+            }}
+          >
+            直近{d}日
+          </button>
+        ))}
+      </div>
+
+      <textarea
+        readOnly
+        value={loading ? "読み込み中…" : text}
+        style={{
+          width: "100%",
+          minHeight: 260,
+          border: `1px solid ${C.line}`,
+          borderRadius: 12,
+          padding: 12,
+          fontFamily: "JetBrains Mono, monospace",
+          fontSize: 12,
+          color: C.ink,
+          background: "#fff",
+          whiteSpace: "pre",
+          overflowX: "auto",
+          resize: "vertical",
+        }}
+      />
+
+      <button
+        onClick={copy}
+        disabled={loading || !text}
+        style={{
+          width: "100%",
+          marginTop: 12,
+          padding: "13px 0",
+          borderRadius: 14,
+          border: "none",
+          background: C.accent,
+          color: "#fff",
+          fontFamily: "Inter, sans-serif",
+          fontWeight: 600,
+          fontSize: 15,
+          cursor: "pointer",
+        }}
+      >
+        {copied ? "コピーしました" : "コピーする"}
+      </button>
+      <div style={{ fontFamily: "Inter, sans-serif", fontSize: 11.5, color: C.inkSoft, marginTop: 8 }}>
+        コピーできない場合は、上のテキストを長押しして選択・コピーしてください。
+      </div>
+    </div>
+  );
+}
+
+// ---------- date picker ----------
+function DatePicker({ value, onChange }) {
+  const isToday = value === todayKey();
+  const shift = (days) => {
+    const [y, m, d] = value.split("-").map(Number);
+    const dt = new Date(y, m - 1, d);
+    dt.setDate(dt.getDate() + days);
+    onChange(`${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`);
+  };
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "0 16px 12px" }}>
+      <button
+        onClick={() => shift(-1)}
+        style={{
+          border: `1px solid ${C.line}`,
+          background: "#fff",
+          borderRadius: 10,
+          width: 32,
+          height: 32,
+          color: C.inkSoft,
+          fontSize: 15,
+          cursor: "pointer",
+        }}
+      >
+        ‹
+      </button>
+      <input
+        type="date"
+        value={value}
+        max={todayKey()}
+        onChange={(e) => e.target.value && onChange(e.target.value)}
+        style={{
+          flex: 1,
+          border: `1px solid ${C.line}`,
+          borderRadius: 10,
+          padding: "6px 8px",
+          fontFamily: "JetBrains Mono, monospace",
+          fontSize: 13,
+          color: C.ink,
+          background: "#fff",
+        }}
+      />
+      <button
+        onClick={() => shift(1)}
+        disabled={isToday}
+        style={{
+          border: `1px solid ${C.line}`,
+          background: "#fff",
+          borderRadius: 10,
+          width: 32,
+          height: 32,
+          color: isToday ? C.line : C.inkSoft,
+          fontSize: 15,
+          cursor: isToday ? "default" : "pointer",
+        }}
+      >
+        ›
+      </button>
+      {!isToday && (
+        <button
+          onClick={() => onChange(todayKey())}
+          style={{
+            border: "none",
+            background: C.accentSoft,
+            color: C.accent,
+            borderRadius: 10,
+            padding: "0 10px",
+            height: 32,
+            fontFamily: "Inter, sans-serif",
+            fontSize: 12,
+            fontWeight: 600,
+            cursor: "pointer",
+            whiteSpace: "nowrap",
+          }}
+        >
+          今日に戻る
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ---------- MAIN APP ----------
+function DayLogApp() {
+  const [tab, setTab] = useState("log");
+  const [entries, setEntries] = useState([]);
+  const [adding, setAdding] = useState(false);
+  const [daySaved, setDaySaved] = useState(null);
+  const [aiResult, setAiResult] = useState(null);
+  const [generating, setGenerating] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  const [weeklyRecords, setWeeklyRecords] = useState([]);
+  const [weeklyLoading, setWeeklyLoading] = useState(false);
+  const [weeklyResult, setWeeklyResult] = useState(null);
+  const [weeklyGenerating, setWeeklyGenerating] = useState(false);
+
+  const [selectedDate, setSelectedDate] = useState(todayKey());
+  const key = selectedDate;
+
+  const loadForDate = useCallback(async (dateKey) => {
+    const savedEntries = await getJSON(`breaklog:${dateKey}`, []);
+    const savedDay = await getJSON(`daysummary:${dateKey}`, null);
+    setEntries(savedEntries);
+    setDaySaved(savedDay);
+    setAiResult(savedDay?.ai ?? null);
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      await loadForDate(selectedDate);
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (loaded) loadForDate(selectedDate);
+  }, [selectedDate]);
+
+  const handleAdd = useCallback(
+    async (newEntries) => {
+      setAdding(true);
+      const list = Array.isArray(newEntries) ? newEntries : [newEntries];
+      const next = [...entries, ...list];
+      setEntries(next);
+      await setJSON(`breaklog:${key}`, next);
+      setAdding(false);
+    },
+    [entries, key]
+  );
+
+  const handleDelete = useCallback(
+    async (id) => {
+      const next = entries.filter((e) => e.id !== id);
+      setEntries(next);
+      await setJSON(`breaklog:${key}`, next);
+    },
+    [entries, key]
+  );
+
+  const handleGenerate = useCallback(
+    async ({ kizuki, kadai, shippai }) => {
+      setGenerating(true);
+      try {
+        const prompt = `以下は今日の休憩ごとの作業ログです（種別-クライアント-成果物-工程／メモ／分数）。
+${JSON.stringify(entries.map((e) => ({ label: entryDisplayText(e), minutes: e.minutes })))}
+
+本人が書いた今日のメモ:
+気づき: ${kizuki || "（なし）"}
+課題: ${kadai || "（なし）"}
+失敗したこと: ${shippai || "（なし）"}
+
+これを踏まえて、以下のJSON形式で「のみ」出力してください。前置きやMarkdownのコードフェンスは一切つけないでください。
+{
+  "feedback": "時間配分の偏りや、繰り返し出ている課題があればそれを踏まえた、客観的で率直、かつ優しいフィードバック（日本語、3〜4文程度）"
+}`;
+        const raw = await callClaude(prompt);
+        const parsed = JSON.parse(stripFence(raw));
+        setAiResult(parsed);
+      } catch (e) {
+        setAiResult({ feedback: `フィードバックの生成に失敗しました：${e.message || "もう一度お試しください。"}` });
+      } finally {
+        setGenerating(false);
+      }
+    },
+    [entries]
+  );
+
+  const handleSave = useCallback(
+    async ({ kizuki, kadai, shippai }) => {
+      setSaving(true);
+      const totalMinutes = entries.reduce((s, e) => s + e.minutes, 0);
+      const record = {
+        date: key,
+        tasks: entries.map((e) => ({ label: entryDisplayText(e), minutes: e.minutes })),
+        totalMinutes,
+        kizuki,
+        kadai,
+        shippai,
+        ai: aiResult,
+      };
+      await setJSON(`daysummary:${key}`, record);
+      setDaySaved(record);
+      setSaving(false);
+    },
+    [entries, key, aiResult]
+  );
+
+  const loadWeekly = useCallback(async () => {
+    setWeeklyLoading(true);
+    const recs = [];
+    for (let i = 0; i < 7; i++) {
+      const k = todayKey(-i);
+      const r = await getJSON(`daysummary:${k}`, null);
+      if (r) recs.push(r);
+    }
+    setWeeklyRecords(recs);
+    setWeeklyLoading(false);
+  }, []);
+
+  useEffect(() => {
+    if (tab === "weekly") loadWeekly();
+  }, [tab, loadWeekly]);
+
+  const handleWeeklyGenerate = useCallback(async () => {
+    setWeeklyGenerating(true);
+    try {
+      const prompt = `以下は直近1週間分の日次記録です。
+${JSON.stringify(weeklyRecords)}
+
+これを踏まえて、日本語のプレーンテキストで週次の振り返りを書いてください。Markdownの記号（#や*など）は使わないでください。以下の3点を含め、全体で300字程度にまとめてください。
+1. 時間の使い方の傾向
+2. 繰り返し出ている課題
+3. 来週に向けての提案`;
+      const text = await callClaude(prompt);
+      setWeeklyResult(text.trim());
+    } catch (e) {
+      setWeeklyResult(`週次まとめの生成に失敗しました：${e.message || "もう一度お試しください。"}`);
+    } finally {
+      setWeeklyGenerating(false);
+    }
+  }, [weeklyRecords]);
+
+  if (!loaded) {
+    return (
+      <div style={{ minHeight: "100vh", background: C.paper, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <style>{FONTS}</style>
+        <span style={{ fontFamily: "Inter, sans-serif", color: C.inkSoft, fontSize: 13 }}>読み込み中…</span>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.paper, display: "flex", flexDirection: "column", maxWidth: 480, margin: "0 auto" }}>
+      <style>{FONTS}</style>
+      <div style={{ padding: "20px 16px 4px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ fontFamily: "Inter, sans-serif", fontSize: 11, fontWeight: 600, letterSpacing: 1, color: C.accent, textTransform: "uppercase" }}>
+          Work Log
+        </div>
+        <button
+          onClick={() => promptForApiKey()}
+          title="APIキーを設定・変更"
+          style={{
+            border: "none",
+            background: "none",
+            color: C.inkSoft,
+            fontSize: 11,
+            fontFamily: "Inter, sans-serif",
+            cursor: "pointer",
+          }}
+        >
+          ⚙ APIキー設定
+        </button>
+      </div>
+      {(tab === "log" || tab === "summary") && (
+        <DatePicker value={selectedDate} onChange={setSelectedDate} />
+      )}
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        {tab === "log" && (
+          <LogTab
+            entries={entries}
+            onAdd={handleAdd}
+            onDelete={handleDelete}
+            adding={adding}
+            dateKey={selectedDate}
+            isToday={selectedDate === todayKey()}
+          />
+        )}
+        {tab === "summary" && (
+          <SummaryTab
+            entries={entries}
+            saved={daySaved}
+            onSave={handleSave}
+            saving={saving}
+            generating={generating}
+            onGenerate={handleGenerate}
+            aiResult={aiResult}
+            setAiResult={setAiResult}
+            dateKey={selectedDate}
+          />
+        )}
+        {tab === "weekly" && (
+          <WeeklyTab
+            records={weeklyRecords}
+            loading={weeklyLoading}
+            onGenerate={handleWeeklyGenerate}
+            generating={weeklyGenerating}
+            result={weeklyResult}
+          />
+        )}
+        {tab === "export" && <ExportTab />}
+      </div>
+      <TabBar active={tab} onChange={setTab} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<DayLogApp />);
+</script>
+<script>
+(function () {
+  var src = document.getElementById("app-source").textContent;
+  var out = Babel.transform(src, { presets: [["react", { runtime: "classic" }]] }).code;
+  var s = document.createElement("script");
+  s.textContent = out;
+  document.body.appendChild(s);
+})();
+</script>
+</body>
+</html>
